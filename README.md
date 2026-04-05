@@ -13,13 +13,13 @@ Local BM25 RAG pipeline for the [Pi coding agent](https://github.com/badlogic/pi
 ## Install
 
 ```bash
-pi install npm:pi-lens
+pi install npm:pi-local-rag
 ```
 
 Or via git:
 
 ```bash
-pi install git:github.com/kowsari/pi-lens
+pi install git:github.com/vahidkowsari/pi-lens
 ```
 
 ## Commands
