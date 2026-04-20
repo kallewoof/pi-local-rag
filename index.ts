@@ -313,6 +313,13 @@ export async function indexFiles(
   return { indexed, chunks: chunked, skipped, durationMs: Date.now() - startMs };
 }
 
+// ─── Staleness ───────────────────────────────────────────────────────────────
+
+export function isIndexStale(index: IndexMeta, maxAgeMs = 24 * 60 * 60 * 1000): boolean {
+  if (!index.lastBuild) return false;
+  return Date.now() - new Date(index.lastBuild).getTime() > maxAgeMs;
+}
+
 // ─── Search ───────────────────────────────────────────────────────────────────
 
 interface ScoredChunk {
@@ -395,8 +402,18 @@ export default function (pi: ExtensionAPI) {
     const config = loadConfig();
     if (!config.ragEnabled) return;
 
-    const index = loadIndex();
+    let index = loadIndex();
     if (!index.chunks.length) return;
+
+    if (isIndexStale(index)) {
+      const existingFiles = Object.keys(index.files).filter(f => existsSync(f));
+      if (existingFiles.length) {
+        stderrProgress(`[rag] Index stale, refreshing ${existingFiles.length} files…`);
+        await indexFiles(existingFiles);
+        process.stderr.write(`\r\x1b[2K`);
+        index = loadIndex();
+      }
+    }
 
     const results = await hybridSearch(event.prompt, index, config.ragTopK, config.ragAlpha);
     const relevant = results.filter(r => r.hybrid >= config.ragScoreThreshold);
