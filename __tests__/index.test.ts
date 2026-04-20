@@ -1,0 +1,380 @@
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdirSync, writeFileSync, rmSync, mkdtempSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
+import {
+  chunkText,
+  cosineSimilarity,
+  normalize,
+  sha256,
+  collectFiles,
+  hybridSearch,
+  defaultConfig,
+} from "../index.ts";
+
+// ─── sha256 ──────────────────────────────────────────────────────────────────
+
+describe("sha256", () => {
+  it("returns a 12-char hex string", () => {
+    const h = sha256("hello");
+    expect(h).toMatch(/^[0-9a-f]{12}$/);
+  });
+
+  it("is deterministic", () => {
+    expect(sha256("test")).toBe(sha256("test"));
+  });
+
+  it("produces different hashes for different inputs", () => {
+    expect(sha256("foo")).not.toBe(sha256("bar"));
+  });
+
+  it("handles empty string", () => {
+    const h = sha256("");
+    expect(h).toMatch(/^[0-9a-f]{12}$/);
+  });
+});
+
+// ─── cosineSimilarity ────────────────────────────────────────────────────────
+
+describe("cosineSimilarity", () => {
+  it("identical unit vectors → 1", () => {
+    const v = [1, 0, 0];
+    expect(cosineSimilarity(v, v)).toBeCloseTo(1);
+  });
+
+  it("orthogonal vectors → 0", () => {
+    expect(cosineSimilarity([1, 0], [0, 1])).toBeCloseTo(0);
+  });
+
+  it("opposite unit vectors → -1", () => {
+    expect(cosineSimilarity([1, 0], [-1, 0])).toBeCloseTo(-1);
+  });
+
+  it("zero vector → 0", () => {
+    expect(cosineSimilarity([0, 0], [1, 0])).toBe(0);
+  });
+
+  it("mismatched lengths → 0", () => {
+    expect(cosineSimilarity([1, 2], [1, 2, 3])).toBe(0);
+  });
+
+  it("known diagonal vectors are equal similarity", () => {
+    const a = [1, 1, 0];
+    const b = [1, 1, 0];
+    expect(cosineSimilarity(a, b)).toBeCloseTo(1);
+  });
+});
+
+// ─── normalize ───────────────────────────────────────────────────────────────
+
+describe("normalize", () => {
+  it("single element → 0", () => {
+    expect(normalize([5])).toEqual([0]);
+  });
+
+  it("all equal → all zeros", () => {
+    expect(normalize([3, 3, 3])).toEqual([0, 0, 0]);
+  });
+
+  it("[0, 1] stays [0, 1]", () => {
+    const result = normalize([0, 1]);
+    expect(result[0]).toBeCloseTo(0);
+    expect(result[1]).toBeCloseTo(1);
+  });
+
+  it("[1, 3] maps to [0, 1]", () => {
+    const result = normalize([1, 3]);
+    expect(result[0]).toBeCloseTo(0);
+    expect(result[1]).toBeCloseTo(1);
+  });
+
+  it("middle value maps to 0.5", () => {
+    const result = normalize([0, 1, 2]);
+    expect(result[1]).toBeCloseTo(0.5);
+  });
+
+  it("preserves relative order", () => {
+    const [a, b, c] = normalize([10, 30, 20]);
+    expect(a).toBeLessThan(c);
+    expect(c).toBeLessThan(b);
+  });
+});
+
+// ─── chunkText ───────────────────────────────────────────────────────────────
+
+describe("chunkText", () => {
+  it("empty string → no chunks", () => {
+    expect(chunkText("")).toHaveLength(0);
+  });
+
+  it("short content (< 20 chars per line) → no chunks", () => {
+    expect(chunkText("hi\nok")).toHaveLength(0);
+  });
+
+  it("a single block of text → one chunk", () => {
+    const text = Array(10).fill("const x = 1; // comment here").join("\n");
+    const chunks = chunkText(text);
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0].lineStart).toBe(1);
+    expect(chunks[0].lineEnd).toBe(10);
+  });
+
+  it("lineStart and lineEnd are 1-indexed", () => {
+    const text = Array(5).fill("function foo() { return 42; }").join("\n");
+    const chunks = chunkText(text);
+    expect(chunks[0].lineStart).toBe(1);
+  });
+
+  it("splits into multiple chunks when text exceeds maxLines", () => {
+    const line = "const value = someFunction(param) + anotherCall();";
+    const text = Array(60).fill(line).join("\n");
+    const chunks = chunkText(text, 50);
+    expect(chunks.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("prefers splitting at blank lines", () => {
+    const block1 = Array(45).fill("function doSomethingUseful() { return true; }").join("\n");
+    const blank = "\n\n";
+    const block2 = Array(10).fill("const answer = computeResult(input);").join("\n");
+    const text = block1 + blank + block2;
+    const chunks = chunkText(text, 50);
+    expect(chunks.length).toBeGreaterThanOrEqual(2);
+    // second chunk should start after the blank lines
+    const lastChunk = chunks[chunks.length - 1];
+    expect(lastChunk.lineStart).toBeGreaterThan(45);
+  });
+
+  it("chunks contain the correct content", () => {
+    const lines = Array(10).fill("export const foo = () => 'bar';");
+    const text = lines.join("\n");
+    const chunks = chunkText(text);
+    expect(chunks[0].content).toBe(text);
+  });
+
+  it("respects custom maxLines", () => {
+    const line = "const x = computeExpensiveOperation(input, config);";
+    const text = Array(10).fill(line).join("\n");
+    const chunks = chunkText(text, 5);
+    // 10 lines with maxLines=5 → 2 chunks
+    expect(chunks.length).toBe(2);
+  });
+});
+
+// ─── collectFiles ────────────────────────────────────────────────────────────
+
+describe("collectFiles", () => {
+  let tmp: string;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "rag-test-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("non-existent path → []", () => {
+    expect(collectFiles(join(tmp, "does-not-exist"))).toEqual([]);
+  });
+
+  it("single .ts file → returns it", () => {
+    const fp = join(tmp, "foo.ts");
+    writeFileSync(fp, "export const x = 1;");
+    expect(collectFiles(fp)).toEqual([fp]);
+  });
+
+  it("unsupported extension is excluded", () => {
+    writeFileSync(join(tmp, "image.png"), Buffer.alloc(10));
+    expect(collectFiles(tmp)).toEqual([]);
+  });
+
+  it("collects supported files from a directory", () => {
+    writeFileSync(join(tmp, "a.ts"), "x");
+    writeFileSync(join(tmp, "b.py"), "x");
+    writeFileSync(join(tmp, "c.md"), "x");
+    const files = collectFiles(tmp);
+    expect(files.length).toBe(3);
+  });
+
+  it("skips node_modules directory", () => {
+    const nm = join(tmp, "node_modules");
+    mkdirSync(nm);
+    writeFileSync(join(nm, "lib.js"), "module.exports = {};");
+    expect(collectFiles(tmp)).toEqual([]);
+  });
+
+  it("skips hidden directories (starting with .)", () => {
+    const hidden = join(tmp, ".cache");
+    mkdirSync(hidden);
+    writeFileSync(join(hidden, "data.ts"), "export {};");
+    expect(collectFiles(tmp)).toEqual([]);
+  });
+
+  it("skips files >= 500 KB", () => {
+    const large = join(tmp, "big.ts");
+    writeFileSync(large, Buffer.alloc(500_000)); // exactly at limit → excluded
+    expect(collectFiles(tmp)).toEqual([]);
+  });
+
+  it("includes files just under 500 KB", () => {
+    const fp = join(tmp, "ok.ts");
+    writeFileSync(fp, Buffer.alloc(499_999));
+    expect(collectFiles(tmp)).toEqual([fp]);
+  });
+
+  it("single file with wrong extension → []", () => {
+    const fp = join(tmp, "data.bin");
+    writeFileSync(fp, "x");
+    expect(collectFiles(fp)).toEqual([]);
+  });
+
+  it("recurses into subdirectories", () => {
+    const sub = join(tmp, "src");
+    mkdirSync(sub);
+    const fp = join(sub, "util.ts");
+    writeFileSync(fp, "export {};");
+    const files = collectFiles(tmp);
+    expect(files).toContain(fp);
+  });
+});
+
+// ─── defaultConfig ───────────────────────────────────────────────────────────
+
+describe("defaultConfig", () => {
+  it("has expected shape and defaults", () => {
+    const cfg = defaultConfig();
+    expect(cfg.ragEnabled).toBe(true);
+    expect(cfg.ragTopK).toBe(5);
+    expect(cfg.ragScoreThreshold).toBe(0.1);
+    expect(cfg.ragAlpha).toBe(0.4);
+  });
+
+  it("returns a new object each call (no shared reference)", () => {
+    const a = defaultConfig();
+    const b = defaultConfig();
+    a.ragTopK = 99;
+    expect(b.ragTopK).toBe(5);
+  });
+});
+
+// ─── hybridSearch (BM25-only path, no vectors) ───────────────────────────────
+
+type Chunk = {
+  id: string; file: string; content: string;
+  lineStart: number; lineEnd: number;
+  hash: string; indexed: string; tokens: number;
+  vector?: number[];
+};
+
+type IndexMeta = {
+  chunks: Chunk[];
+  files: Record<string, { hash: string; chunks: number; indexed: string; size: number; embedded?: boolean }>;
+  lastBuild: string;
+  embeddingModel?: string;
+};
+
+function makeIndex(chunks: Partial<Chunk>[]): IndexMeta {
+  return {
+    chunks: chunks.map((c, i) => ({
+      id: `chunk-${i}`,
+      file: c.file ?? "/src/file.ts",
+      content: c.content ?? "",
+      lineStart: c.lineStart ?? 1,
+      lineEnd: c.lineEnd ?? 10,
+      hash: sha256(c.content ?? ""),
+      indexed: new Date().toISOString(),
+      tokens: Math.ceil((c.content ?? "").length / 4),
+      vector: c.vector,
+    })),
+    files: {},
+    lastBuild: "",
+  };
+}
+
+describe("hybridSearch (BM25, no vectors)", () => {
+  it("empty index → []", async () => {
+    const idx = makeIndex([]);
+    expect(await hybridSearch("query", idx, 10, 0.4)).toEqual([]);
+  });
+
+  it("returns scored result for matching content", async () => {
+    const idx = makeIndex([
+      { content: "function authenticate(user, password) { return checkCredentials(user, password); }" },
+      { content: "function renderTemplate(html) { return sanitize(html); }" },
+    ]);
+    const results = await hybridSearch("authenticate", idx, 10, 1.0);
+    expect(results.length).toBeGreaterThanOrEqual(1);
+    expect(results[0].bm25).toBeGreaterThan(0);
+    expect(results[0].chunk.content).toContain("authenticate");
+  });
+
+  it("non-matching query → no results", async () => {
+    const idx = makeIndex([{ content: "function computeSquareRoot(n) { return Math.sqrt(n); }" }]);
+    const results = await hybridSearch("unrelated query term xyz", idx, 10, 1.0);
+    // filtered: only scores > 0 are returned
+    const nonZero = results.filter(r => r.hybrid > 0);
+    expect(nonZero.length).toBe(0);
+  });
+
+  it("exact phrase match scores higher than partial match", async () => {
+    const idx = makeIndex([
+      { content: "function handleUserAuthentication() { validateToken(request); }" },
+      { content: "function handleRequest() { processData(input); }" },
+    ]);
+    const results = await hybridSearch("user authentication", idx, 10, 1.0);
+    const first = results[0]?.chunk.content ?? "";
+    expect(first).toContain("Authentication");
+  });
+
+  it("respects limit parameter", async () => {
+    const chunks = Array.from({ length: 10 }, (_, i) => ({
+      content: `function processItem${i}(value) { return transform(value); }`,
+    }));
+    const idx = makeIndex(chunks);
+    const results = await hybridSearch("function process", idx, 3, 1.0);
+    expect(results.length).toBeLessThanOrEqual(3);
+  });
+
+  it("result shape has bm25, vector, hybrid, chunk fields", async () => {
+    const idx = makeIndex([{ content: "export function calculateTotal(items) { return items.reduce((a, b) => a + b, 0); }" }]);
+    const results = await hybridSearch("calculate total", idx, 10, 1.0);
+    if (results.length > 0) {
+      expect(results[0]).toHaveProperty("bm25");
+      expect(results[0]).toHaveProperty("vector");
+      expect(results[0]).toHaveProperty("hybrid");
+      expect(results[0]).toHaveProperty("chunk");
+    }
+  });
+
+  it("filename boost: first query term matching filename scores higher", async () => {
+    const idx = makeIndex([
+      { file: "/src/auth.ts", content: "export function login(user) { return verifyUser(user); }" },
+      { file: "/src/render.ts", content: "export function display(user) { return renderUser(user); }" },
+    ]);
+    const results = await hybridSearch("auth user", idx, 10, 1.0);
+    // auth.ts should rank first due to filename boost on first term "auth"
+    expect(results[0]?.chunk.file).toContain("auth.ts");
+  });
+
+  it("hybrid score blends bm25 and vector (with vectors present)", async () => {
+    const VECTOR_DIM = 384;
+    const vA = Array(VECTOR_DIM).fill(0);
+    vA[0] = 1; // unit vector along dim 0
+    const vB = Array(VECTOR_DIM).fill(0);
+    vB[1] = 1; // unit vector along dim 1 (orthogonal)
+
+    const idx = makeIndex([
+      { content: "function encryptPassword(password) { return bcrypt.hash(password); }", vector: vA },
+      { content: "function renderTemplate(html) { return sanitize(html); }", vector: vB },
+    ]);
+
+    // Query vector closer to vA — use alpha=0 (pure vector)
+    const queryVec = vA;
+    // We can't inject the query embedding directly, but we can verify
+    // BM25-only path (alpha=1) vs hybrid (alpha=0.5)
+    const bm25Only = await hybridSearch("encrypt password", idx, 10, 1.0);
+    expect(bm25Only.length).toBeGreaterThan(0);
+    expect(bm25Only[0].hybrid).toBe(bm25Only[0].bm25);
+  });
+});

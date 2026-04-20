@@ -73,7 +73,7 @@ interface RagConfig {
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-function loadConfig(): RagConfig {
+export function loadConfig(): RagConfig {
   ensureDir();
   if (!existsSync(CONFIG_FILE)) return defaultConfig();
   try {
@@ -81,11 +81,11 @@ function loadConfig(): RagConfig {
   } catch { return defaultConfig(); }
 }
 
-function defaultConfig(): RagConfig {
+export function defaultConfig(): RagConfig {
   return { ragEnabled: true, ragTopK: 5, ragScoreThreshold: 0.1, ragAlpha: 0.4 };
 }
 
-function saveConfig(config: RagConfig) {
+export function saveConfig(config: RagConfig) {
   ensureDir();
   writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
 }
@@ -126,7 +126,7 @@ function saveIndex(index: IndexMeta) {
   writeFileSync(INDEX_FILE, JSON.stringify(index, null, 2));
 }
 
-function sha256(data: string): string {
+export function sha256(data: string): string {
   return createHash("sha256").update(data).digest("hex").slice(0, 12);
 }
 
@@ -147,7 +147,7 @@ async function embed(text: string): Promise<number[]> {
   return Array.from(output.data as Float32Array);
 }
 
-async function embedBatch(texts: string[], onProgress?: (i: number, total: number) => void): Promise<number[][]> {
+export async function embedBatch(texts: string[], onProgress?: (i: number, total: number) => void): Promise<number[][]> {
   const results: number[][] = [];
   for (let i = 0; i < texts.length; i++) {
     results.push(await embed(texts[i]));
@@ -158,7 +158,7 @@ async function embedBatch(texts: string[], onProgress?: (i: number, total: numbe
 
 // ─── Math ────────────────────────────────────────────────────────────────────
 
-function cosineSimilarity(a: number[], b: number[]): number {
+export function cosineSimilarity(a: number[], b: number[]): number {
   if (a.length !== b.length) return 0;
   let dot = 0, normA = 0, normB = 0;
   for (let i = 0; i < a.length; i++) {
@@ -170,7 +170,7 @@ function cosineSimilarity(a: number[], b: number[]): number {
   return denom === 0 ? 0 : dot / denom;
 }
 
-function normalize(scores: number[]): number[] {
+export function normalize(scores: number[]): number[] {
   const max = Math.max(...scores);
   const min = Math.min(...scores);
   const range = max - min;
@@ -180,7 +180,7 @@ function normalize(scores: number[]): number[] {
 
 // ─── Chunking & File Collection ──────────────────────────────────────────────
 
-function chunkText(text: string, maxLines = 50): { content: string; lineStart: number; lineEnd: number }[] {
+export function chunkText(text: string, maxLines = 50): { content: string; lineStart: number; lineEnd: number }[] {
   const lines = text.split("\n");
   const chunks: { content: string; lineStart: number; lineEnd: number }[] = [];
   let i = 0;
@@ -198,7 +198,7 @@ function chunkText(text: string, maxLines = 50): { content: string; lineStart: n
   return chunks;
 }
 
-function collectFiles(dirPath: string): string[] {
+export function collectFiles(dirPath: string): string[] {
   const files: string[] = [];
   function walk(dir: string) {
     try {
@@ -241,7 +241,7 @@ function stderrProgress(msg: string) {
   process.stderr.write(`\r\x1b[2K${msg}`);
 }
 
-async function indexFiles(
+export async function indexFiles(
   paths: string[],
   progress?: ProgressCallbacks
 ): Promise<{ indexed: number; chunks: number; skipped: number; durationMs: number }> {
@@ -322,7 +322,7 @@ interface ScoredChunk {
   hybrid: number;
 }
 
-async function hybridSearch(
+export async function hybridSearch(
   query: string,
   index: IndexMeta,
   limit = 10,
