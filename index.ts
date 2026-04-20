@@ -419,15 +419,16 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("rag", {
     description: "pi-local-rag: /rag index|search|status|rebuild|clear|on|off",
     handler: async (args, ctx) => {
+      const reply = (text: string) => pi.sendMessage({ customType: "rag", content: text, display: true });
       const parts = (args || "").trim().split(/\s+/);
       const cmd = parts[0] || "status";
 
       // ── index ──
       if (cmd === "index") {
         const path = parts[1] || ".";
-        if (!existsSync(path)) return `${RED}Path not found:${RST} ${path}`;
+        if (!existsSync(path)) return reply(`${RED}Path not found:${RST} ${path}`);
         const files = collectFiles(path);
-        if (!files.length) return `${YELLOW}No indexable files found in:${RST} ${path}`;
+        if (!files.length) return reply(`${YELLOW}No indexable files found in:${RST} ${path}`);
 
         const total = files.length;
         ctx.ui.notify(`Found ${total} files to index`, "info");
@@ -460,18 +461,18 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.setWidget("rag", undefined);
 
         const secs = (result.durationMs / 1000).toFixed(1);
-        return `${GREEN}✅ Indexed:${RST} ${result.indexed} files (${result.chunks} chunks) │ ${result.skipped} unchanged │ ${secs}s\n` +
-          `${D}Model: ${EMBEDDING_MODEL} │ Storage: ${RAG_DIR}${RST}`;
+        return reply(`${GREEN}✅ Indexed:${RST} ${result.indexed} files (${result.chunks} chunks) │ ${result.skipped} unchanged │ ${secs}s\n` +
+          `${D}Model: ${EMBEDDING_MODEL} │ Storage: ${RAG_DIR}${RST}`);
       }
 
       // ── search ──
       if (cmd === "search") {
         const query = parts.slice(1).join(" ");
-        if (!query) return `${YELLOW}Usage:${RST} /rag search <query>`;
+        if (!query) return reply(`${YELLOW}Usage:${RST} /rag search <query>`);
         const index = loadIndex();
         const config = loadConfig();
         const results = await hybridSearch(query, index, 10, config.ragAlpha);
-        if (!results.length) return `${YELLOW}No results for:${RST} ${query}`;
+        if (!results.length) return reply(`${YELLOW}No results for:${RST} ${query}`);
 
         const hasVectors = index.chunks.some(c => c.vector);
         let out = `${B}${CYAN}🔍 ${results.length} results for "${query}"${RST}`;
@@ -484,7 +485,7 @@ export default function (pi: ExtensionAPI) {
           const preview = r.chunk.content.split("\n").slice(0, 3).join("\n");
           out += `${D}${preview.slice(0, 200)}${RST}\n\n`;
         }
-        return out;
+        return reply(out);
       }
 
       // ── on/off toggle ──
@@ -492,16 +493,16 @@ export default function (pi: ExtensionAPI) {
         const config = loadConfig();
         config.ragEnabled = cmd === "on";
         saveConfig(config);
-        return cmd === "on"
+        return reply(cmd === "on"
           ? `${GREEN}✅ RAG auto-injection enabled${RST}`
-          : `${YELLOW}RAG auto-injection disabled${RST}`;
+          : `${YELLOW}RAG auto-injection disabled${RST}`);
       }
 
       // ── rebuild ──
       if (cmd === "rebuild") {
         const index = loadIndex();
         const allFiles = Object.keys(index.files);
-        if (!allFiles.length) return `${YELLOW}No files in index. Run /rag index <path> first.${RST}`;
+        if (!allFiles.length) return reply(`${YELLOW}No files in index. Run /rag index <path> first.${RST}`);
 
         const existingFiles = allFiles.filter(f => existsSync(f));
         const deletedFiles = allFiles.filter(f => !existsSync(f));
@@ -546,13 +547,13 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.setWidget("rag", undefined);
 
         const secs = (result.durationMs / 1000).toFixed(1);
-        return `${GREEN}✅ Rebuilt:${RST} ${result.indexed} re-indexed │ ${result.skipped} unchanged │ ${deletedFiles.length} deleted │ ${result.chunks} chunks │ ${secs}s`;
+        return reply(`${GREEN}✅ Rebuilt:${RST} ${result.indexed} re-indexed │ ${result.skipped} unchanged │ ${deletedFiles.length} deleted │ ${result.chunks} chunks │ ${secs}s`);
       }
 
       // ── clear ──
       if (cmd === "clear") {
         saveIndex({ chunks: [], files: {}, lastBuild: "" });
-        return `${GREEN}✅ Index cleared.${RST}`;
+        return reply(`${GREEN}✅ Index cleared.${RST}`);
       }
 
       // ── status (default) ──
@@ -582,7 +583,7 @@ export default function (pi: ExtensionAPI) {
           out += `    ${ext}: ${count}\n`;
         }
       }
-      return out;
+      reply(out);
     },
   });
 
