@@ -9,6 +9,8 @@ import {
   normalize,
   sha256,
   collectFiles,
+  collectFromTracked,
+  isExcludedByConfig,
   hybridSearch,
   defaultConfig,
 } from "../index.ts";
@@ -237,6 +239,120 @@ describe("collectFiles", () => {
     const files = collectFiles(tmp);
     expect(files).toContain(fp);
   });
+
+  it("excludePatterns: skips files matching a pattern", () => {
+    writeFileSync(join(tmp, "keep.ts"), "x");
+    writeFileSync(join(tmp, "drop.ts"), "x");
+    const files = collectFiles(tmp, ["drop.ts"]);
+    expect(files).toEqual([join(tmp, "keep.ts")]);
+  });
+
+  it("excludePatterns: directory glob skips whole subtree", () => {
+    const sub = join(tmp, "fixtures");
+    mkdirSync(sub);
+    writeFileSync(join(sub, "a.ts"), "x");
+    writeFileSync(join(sub, "b.ts"), "x");
+    writeFileSync(join(tmp, "main.ts"), "x");
+    const files = collectFiles(tmp, ["fixtures/"]);
+    expect(files).toEqual([join(tmp, "main.ts")]);
+  });
+
+  it("excludePatterns: ** glob matches nested files", () => {
+    const sub = join(tmp, "deep", "nested");
+    mkdirSync(sub, { recursive: true });
+    writeFileSync(join(sub, "x.ts"), "x");
+    writeFileSync(join(tmp, "main.ts"), "x");
+    const files = collectFiles(tmp, ["**/x.ts"]);
+    expect(files).toEqual([join(tmp, "main.ts")]);
+  });
+
+  it("excludePatterns: empty list is no-op", () => {
+    writeFileSync(join(tmp, "a.ts"), "x");
+    expect(collectFiles(tmp, [])).toEqual([join(tmp, "a.ts")]);
+  });
+
+  it("excludePatterns: applied to single-file input", () => {
+    const fp = join(tmp, "secret.ts");
+    writeFileSync(fp, "x");
+    expect(collectFiles(fp, ["secret.ts"])).toEqual([]);
+  });
+});
+
+// ─── collectFromTracked ──────────────────────────────────────────────────────
+
+describe("collectFromTracked", () => {
+  let tmpA: string;
+  let tmpB: string;
+
+  beforeEach(() => {
+    tmpA = mkdtempSync(join(tmpdir(), "rag-tracked-a-"));
+    tmpB = mkdtempSync(join(tmpdir(), "rag-tracked-b-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpA, { recursive: true, force: true });
+    rmSync(tmpB, { recursive: true, force: true });
+  });
+
+  it("walks every tracked path and unions results", () => {
+    writeFileSync(join(tmpA, "a.ts"), "x");
+    writeFileSync(join(tmpB, "b.ts"), "x");
+    const cfg = { ...defaultConfig(), trackedPaths: [tmpA, tmpB] };
+    const files = collectFromTracked(cfg);
+    expect(files).toContain(join(tmpA, "a.ts"));
+    expect(files).toContain(join(tmpB, "b.ts"));
+    expect(files.length).toBe(2);
+  });
+
+  it("dedupes when tracked paths overlap", () => {
+    const sub = join(tmpA, "shared");
+    mkdirSync(sub);
+    writeFileSync(join(sub, "x.ts"), "x");
+    const cfg = { ...defaultConfig(), trackedPaths: [tmpA, sub] };
+    const files = collectFromTracked(cfg);
+    expect(files).toEqual([join(sub, "x.ts")]);
+  });
+
+  it("skips non-existent tracked paths", () => {
+    writeFileSync(join(tmpA, "a.ts"), "x");
+    const cfg = { ...defaultConfig(), trackedPaths: [tmpA, join(tmpA, "missing")] };
+    expect(collectFromTracked(cfg)).toEqual([join(tmpA, "a.ts")]);
+  });
+
+  it("applies excludePatterns across all tracked paths", () => {
+    writeFileSync(join(tmpA, "keep.ts"), "x");
+    writeFileSync(join(tmpA, "skip.ts"), "x");
+    writeFileSync(join(tmpB, "skip.ts"), "x");
+    const cfg = { ...defaultConfig(), trackedPaths: [tmpA, tmpB], excludePatterns: ["skip.ts"] };
+    const files = collectFromTracked(cfg);
+    expect(files).toEqual([join(tmpA, "keep.ts")]);
+  });
+
+  it("empty trackedPaths → []", () => {
+    expect(collectFromTracked(defaultConfig())).toEqual([]);
+  });
+});
+
+// ─── isExcludedByConfig ──────────────────────────────────────────────────────
+
+describe("isExcludedByConfig", () => {
+  it("returns false when patterns list is empty", () => {
+    expect(isExcludedByConfig("/proj/src/foo.ts", ["/proj"], [])).toBe(false);
+  });
+
+  it("matches a file inside a tracked root", () => {
+    expect(isExcludedByConfig("/proj/src/foo.ts", ["/proj"], ["src/foo.ts"])).toBe(true);
+  });
+
+  it("does not match files outside any tracked root", () => {
+    expect(isExcludedByConfig("/other/src/foo.ts", ["/proj"], ["src/foo.ts"])).toBe(false);
+  });
+
+  it("evaluates patterns against the nearest matching root", () => {
+    expect(
+      isExcludedByConfig("/a/b/c/x.ts", ["/a", "/a/b"], ["c/x.ts"])
+    ).toBe(true);
+  });
 });
 
 // ─── defaultConfig ───────────────────────────────────────────────────────────
@@ -248,13 +364,19 @@ describe("defaultConfig", () => {
     expect(cfg.ragTopK).toBe(5);
     expect(cfg.ragScoreThreshold).toBe(0.1);
     expect(cfg.ragAlpha).toBe(0.4);
+    expect(cfg.trackedPaths).toEqual([]);
+    expect(cfg.excludePatterns).toEqual([]);
   });
 
   it("returns a new object each call (no shared reference)", () => {
     const a = defaultConfig();
     const b = defaultConfig();
     a.ragTopK = 99;
+    a.trackedPaths.push("/foo");
+    a.excludePatterns.push("bar");
     expect(b.ragTopK).toBe(5);
+    expect(b.trackedPaths).toEqual([]);
+    expect(b.excludePatterns).toEqual([]);
   });
 });
 

@@ -16,9 +16,10 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, renameSync } from "node:fs";
-import { join, extname, basename } from "node:path";
+import { join, extname, basename, resolve, relative } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
+import ignore from "ignore";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -69,6 +70,8 @@ interface RagConfig {
   ragTopK: number;
   ragScoreThreshold: number;
   ragAlpha: number; // 0 = pure vector, 1 = pure BM25
+  trackedPaths: string[];      // absolute paths previously passed to /rag index
+  excludePatterns: string[];   // gitignore-style patterns
 }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -82,7 +85,10 @@ export function loadConfig(): RagConfig {
 }
 
 export function defaultConfig(): RagConfig {
-  return { ragEnabled: true, ragTopK: 5, ragScoreThreshold: 0.1, ragAlpha: 0.4 };
+  return {
+    ragEnabled: true, ragTopK: 5, ragScoreThreshold: 0.1, ragAlpha: 0.4,
+    trackedPaths: [], excludePatterns: [],
+  };
 }
 
 export function saveConfig(config: RagConfig) {
@@ -198,15 +204,37 @@ export function chunkText(text: string, maxLines = 50): { content: string; lineS
   return chunks;
 }
 
-export function collectFiles(dirPath: string): string[] {
+export function collectFiles(dirPath: string, excludePatterns: string[] = []): string[] {
+  const ig = excludePatterns.length ? ignore().add(excludePatterns) : null;
   const files: string[] = [];
+
+  function isExcluded(absPath: string, root: string): boolean {
+    if (!ig) return false;
+    const rel = relative(root, absPath);
+    if (!rel || rel.startsWith("..")) return false;
+    return ig.ignores(rel);
+  }
+
+  try {
+    const stat = statSync(dirPath);
+    if (stat.isFile()) {
+      if (!TEXT_EXTS.has(extname(dirPath).toLowerCase()) || stat.size >= 500_000) return [];
+      if (ig && ig.ignores(basename(dirPath))) return [];
+      return [dirPath];
+    }
+  } catch { return []; }
+
+  const root = dirPath;
   function walk(dir: string) {
     try {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const fp = join(dir, entry.name);
         if (entry.isDirectory()) {
-          if (!SKIP_DIRS.has(entry.name) && !entry.name.startsWith(".")) walk(join(dir, entry.name));
+          if (SKIP_DIRS.has(entry.name) || entry.name.startsWith(".")) continue;
+          if (isExcluded(fp, root)) continue;
+          walk(fp);
         } else if (TEXT_EXTS.has(extname(entry.name).toLowerCase())) {
-          const fp = join(dir, entry.name);
+          if (isExcluded(fp, root)) continue;
           try {
             if (statSync(fp).size < 500_000) files.push(fp);
           } catch {}
@@ -214,15 +242,29 @@ export function collectFiles(dirPath: string): string[] {
       }
     } catch {}
   }
-  try {
-    const stat = statSync(dirPath);
-    if (stat.isFile()) {
-      if (!TEXT_EXTS.has(extname(dirPath).toLowerCase()) || stat.size >= 500_000) return [];
-      return [dirPath];
-    }
-  } catch { return []; }
-  walk(dirPath);
+  walk(root);
   return files;
+}
+
+export function collectFromTracked(cfg: RagConfig): string[] {
+  const out = new Set<string>();
+  for (const p of cfg.trackedPaths) {
+    if (!existsSync(p)) continue;
+    for (const f of collectFiles(p, cfg.excludePatterns)) out.add(f);
+  }
+  return [...out];
+}
+
+/** Returns true if `file` is matched by `excludePatterns` relative to any of `roots`. */
+export function isExcludedByConfig(file: string, roots: string[], excludePatterns: string[]): boolean {
+  if (!excludePatterns.length) return false;
+  const ig = ignore().add(excludePatterns);
+  for (const root of roots) {
+    const rel = relative(root, file);
+    if (!rel || rel.startsWith("..")) continue;
+    if (ig.ignores(rel)) return true;
+  }
+  return false;
 }
 
 // ─── Indexing ─────────────────────────────────────────────────────────────────
@@ -434,7 +476,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── /rag command ──
   pi.registerCommand("rag", {
-    description: "pi-local-rag: /rag index|search|status|rebuild|clear|on|off",
+    description: "pi-local-rag: /rag index|search|status|rebuild|clear|exclude|on|off",
     handler: async (args, ctx) => {
       const reply = (text: string) => pi.sendMessage({ customType: "rag", content: text, display: true });
       const parts = (args || "").trim().split(/\s+/);
@@ -444,7 +486,13 @@ export default function (pi: ExtensionAPI) {
       if (cmd === "index") {
         const path = parts[1] || ".";
         if (!existsSync(path)) return reply(`${RED}Path not found:${RST} ${path}`);
-        const files = collectFiles(path);
+        const config = loadConfig();
+        const absPath = resolve(path);
+        if (!config.trackedPaths.includes(absPath)) {
+          config.trackedPaths.push(absPath);
+          saveConfig(config);
+        }
+        const files = collectFiles(absPath, config.excludePatterns);
         if (!files.length) return reply(`${YELLOW}No indexable files found in:${RST} ${path}`);
 
         const total = files.length;
@@ -479,7 +527,7 @@ export default function (pi: ExtensionAPI) {
 
         const secs = (result.durationMs / 1000).toFixed(1);
         return reply(`${GREEN}✅ Indexed:${RST} ${result.indexed} files (${result.chunks} chunks) │ ${result.skipped} unchanged │ ${secs}s\n` +
-          `${D}Model: ${EMBEDDING_MODEL} │ Storage: ${RAG_DIR}${RST}`);
+          `${D}Now tracking ${config.trackedPaths.length} path(s) │ Model: ${EMBEDDING_MODEL} │ Storage: ${RAG_DIR}${RST}`);
       }
 
       // ── search ──
@@ -518,23 +566,43 @@ export default function (pi: ExtensionAPI) {
       // ── rebuild ──
       if (cmd === "rebuild") {
         const index = loadIndex();
-        const allFiles = Object.keys(index.files);
-        if (!allFiles.length) return reply(`${YELLOW}No files in index. Run /rag index <path> first.${RST}`);
+        const config = loadConfig();
+        const indexedFiles = Object.keys(index.files);
+        const trackedFiles = collectFromTracked(config);
 
-        const existingFiles = allFiles.filter(f => existsSync(f));
-        const deletedFiles = allFiles.filter(f => !existsSync(f));
+        // Union of currently-indexed files and files discovered by walking tracked paths.
+        const targetSet = new Set<string>([...trackedFiles]);
+        for (const f of indexedFiles) {
+          if (existsSync(f) && !isExcludedByConfig(f, config.trackedPaths, config.excludePatterns)) {
+            targetSet.add(f);
+          }
+        }
+        const targetFiles = [...targetSet];
 
-        // Prune deleted files
-        for (const f of deletedFiles) {
+        if (!targetFiles.length && !indexedFiles.length) {
+          return reply(`${YELLOW}No files to rebuild. Run /rag index <path> first.${RST}`);
+        }
+
+        // Files in the index but no longer present (deleted, excluded, or untracked).
+        const droppedFiles = indexedFiles.filter(f => !targetSet.has(f));
+        for (const f of droppedFiles) {
           index.chunks = index.chunks.filter(c => c.file !== f);
           delete index.files[f];
         }
-        // Force re-embed all existing files
-        for (const f of existingFiles) { if (index.files[f]) index.files[f].embedded = false; }
+
+        // Force re-embed all target files (treat new ones as not yet embedded).
+        for (const f of targetFiles) {
+          if (index.files[f]) index.files[f].embedded = false;
+        }
         saveIndex(index);
 
-        if (deletedFiles.length) ctx.ui.notify(`Pruned ${deletedFiles.length} deleted files`, "info");
-        ctx.ui.notify(`Rebuilding ${existingFiles.length} files...`, "info");
+        const newFiles = targetFiles.filter(f => !indexedFiles.includes(f));
+        if (droppedFiles.length) ctx.ui.notify(`Pruned ${droppedFiles.length} files (deleted/excluded)`, "info");
+        if (newFiles.length) ctx.ui.notify(`Discovered ${newFiles.length} new files`, "info");
+        ctx.ui.notify(`Rebuilding ${targetFiles.length} files...`, "info");
+
+        const existingFiles = targetFiles;
+        const deletedFiles = droppedFiles;
 
         function progressBar(n: number, total: number, width = 24): string {
           const filled = Math.round((n / total) * width);
@@ -565,6 +633,37 @@ export default function (pi: ExtensionAPI) {
 
         const secs = (result.durationMs / 1000).toFixed(1);
         return reply(`${GREEN}✅ Rebuilt:${RST} ${result.indexed} re-indexed │ ${result.skipped} unchanged │ ${deletedFiles.length} deleted │ ${result.chunks} chunks │ ${secs}s`);
+      }
+
+      // ── exclude ──
+      if (cmd === "exclude") {
+        const config = loadConfig();
+        const expr = parts.slice(1).join(" ").trim();
+
+        if (!expr) {
+          if (!config.excludePatterns.length) return reply(`${YELLOW}No exclude patterns set.${RST}\n${D}Add one with: /rag exclude <pattern>${RST}`);
+          let out = `${B}${CYAN}Exclude patterns (${config.excludePatterns.length}):${RST}\n`;
+          for (const p of config.excludePatterns) out += `  ${p}\n`;
+          return reply(out);
+        }
+
+        if (expr.startsWith("-")) {
+          const target = expr.slice(1);
+          const before = config.excludePatterns.length;
+          config.excludePatterns = config.excludePatterns.filter(p => p !== target);
+          if (config.excludePatterns.length === before) {
+            return reply(`${YELLOW}Pattern not found:${RST} ${target}`);
+          }
+          saveConfig(config);
+          return reply(`${GREEN}✅ Removed exclude:${RST} ${target}\n${D}${config.excludePatterns.length} pattern(s) remain. Run /rag rebuild to re-apply.${RST}`);
+        }
+
+        if (config.excludePatterns.includes(expr)) {
+          return reply(`${YELLOW}Already excluded:${RST} ${expr}`);
+        }
+        config.excludePatterns.push(expr);
+        saveConfig(config);
+        return reply(`${GREEN}✅ Added exclude:${RST} ${expr}\n${D}${config.excludePatterns.length} pattern(s) total. Run /rag rebuild to re-apply.${RST}`);
       }
 
       // ── clear ──
@@ -600,6 +699,21 @@ export default function (pi: ExtensionAPI) {
           out += `    ${ext}: ${count}\n`;
         }
       }
+
+      out += `\n  ${B}Tracked paths:${RST}\n`;
+      if (config.trackedPaths.length) {
+        for (const p of config.trackedPaths) out += `    ${p}\n`;
+      } else {
+        out += `    ${D}(none — run /rag index <path> to track)${RST}\n`;
+      }
+
+      out += `\n  ${B}Exclude patterns:${RST}\n`;
+      if (config.excludePatterns.length) {
+        for (const p of config.excludePatterns) out += `    ${p}\n`;
+      } else {
+        out += `    ${D}(none — add with /rag exclude <pattern>)${RST}\n`;
+      }
+
       reply(out);
     },
   });
@@ -615,7 +729,13 @@ export default function (pi: ExtensionAPI) {
     }),
     execute: async (_toolCallId, params) => {
       if (!existsSync(params.path)) return { content: [{ type: "text" as const, text: `Path not found: ${params.path}` }], details: undefined };
-      const files = collectFiles(params.path);
+      const config = loadConfig();
+      const absPath = resolve(params.path);
+      if (!config.trackedPaths.includes(absPath)) {
+        config.trackedPaths.push(absPath);
+        saveConfig(config);
+      }
+      const files = collectFiles(absPath, config.excludePatterns);
       if (!files.length) return { content: [{ type: "text" as const, text: `No indexable text files found in: ${params.path}` }], details: undefined };
       const result = await indexFiles(files, {});
       process.stderr.write(`\n`);
