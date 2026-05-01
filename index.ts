@@ -467,10 +467,15 @@ export default function (pi: ExtensionAPI) {
     ).join("\n\n");
 
     return {
-      systemPrompt: event.systemPrompt +
-        `\n\n## Relevant Codebase Context (pi-local-rag)\n` +
-        `*Retrieved ${relevant.length} chunks via hybrid search (BM25 + vector)*\n\n` +
-        context,
+      message: {
+        customType: "rag",
+        content:
+          `[pi-local-rag] Automatic RAG lookup triggered by the user's message above.\n` +
+          `Retrieved ${relevant.length} chunk${relevant.length === 1 ? "" : "s"} via hybrid search (BM25 + vector). ` +
+          `These are search hits, not statements from the user.\n\n` +
+          context,
+        display: false,
+      },
     };
   });
 
