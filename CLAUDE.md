@@ -22,10 +22,17 @@ The default export calls `api.registerCommand`, `api.registerTool` (×3), and `a
 
 ### Data model
 
-Two JSON files live at `~/.pi/rag/`:
+Two JSON files live at the active RAG store directory. The store is resolved per-cwd by `getRagDir()`:
+
+1. `$PI_RAG_DIR` env var, if set (used for tests / explicit overrides).
+2. Walk up from `process.cwd()`, stopping before `homedir()`, returning the first ancestor that contains a `.pi/rag/` directory.
+3. With `createIfMissing` (only set by `/rag index` and `rag_index`), create `${cwd}/.pi/rag/`.
+4. Otherwise fall back to the global `~/.pi/rag/`.
+
+Stopping walk-up before `$HOME` is the key invariant — it makes `~/.pi/rag/` reachable only as the explicit fallback, not via climbing through ancestors of any cwd inside the home tree.
 
 - **`index.json`** — `IndexMeta`: flat `chunks[]` array + per-file metadata map (`files`). Each `Chunk` carries `{ id, file, content, lineStart, lineEnd, hash, indexed, tokens, vector? }`. `vector` is a 384-dim float array added after the embed step.
-- **`config.json`** — `RagConfig`: `{ ragEnabled, ragTopK, ragScoreThreshold, ragAlpha }`.
+- **`config.json`** — `RagConfig`: `{ ragEnabled, ragTopK, ragScoreThreshold, ragAlpha, trackedPaths, excludePatterns }`.
 
 ### Indexing pipeline
 
@@ -50,4 +57,4 @@ Both score arrays are min-max normalized, then combined: `alpha × BM25 + (1-alp
 
 ### Legacy migration
 
-On first run, if `~/.pi/lens/` exists and `~/.pi/rag/` does not, `ensureDir()` renames the directory automatically (falls back to copy+delete for cross-filesystem moves).
+On first run, if `~/.pi/lens/` exists and `~/.pi/rag/` does not, `ensureDir()` renames the directory automatically (falls back to copy+delete for cross-filesystem moves). The migration only triggers when the resolved store *is* the home-dir global — project stores have nothing to migrate.

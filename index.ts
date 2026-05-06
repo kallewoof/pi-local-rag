@@ -4,6 +4,10 @@
  * Index local files → chunk → embed → store → retrieve → inject into LLM context.
  * Uses Transformers.js (ONNX) for local embeddings — zero cloud dependency.
  *
+ * Storage is per-cwd: walk up from the working directory looking for a `.pi/rag/`
+ * project store; fall back to `~/.pi/rag/` as the global default. The first
+ * `/rag index` in a directory with no parent store creates one at cwd.
+ *
  * /rag index <path>     → index + embed a file or directory
  * /rag search <query>   → hybrid search (BM25 + vector)
  * /rag status           → show index stats
@@ -16,17 +20,15 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, renameSync } from "node:fs";
-import { join, extname, basename, resolve, relative } from "node:path";
+import { join, extname, basename, resolve, relative, dirname } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 import ignore from "ignore";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const RAG_DIR = join(homedir(), ".pi", "rag");
 const LEGACY_DIR = join(homedir(), ".pi", "lens"); // renamed from lens → rag
-const INDEX_FILE = join(RAG_DIR, "index.json");
-const CONFIG_FILE = join(RAG_DIR, "config.json");
+const GLOBAL_RAG_DIR = () => join(homedir(), ".pi", "rag");
 
 const RST = "\x1b[0m", B = "\x1b[1m", D = "\x1b[2m";
 const GREEN = "\x1b[32m", YELLOW = "\x1b[33m", CYAN = "\x1b[36m", RED = "\x1b[31m", MAGENTA = "\x1b[35m";
@@ -74,13 +76,57 @@ interface RagConfig {
   excludePatterns: string[];   // gitignore-style patterns
 }
 
+// ─── Store resolution ────────────────────────────────────────────────────────
+
+/**
+ * Resolve the active RAG store directory for the current cwd.
+ *
+ * 1. `$PI_RAG_DIR` — explicit override, wins over everything.
+ * 2. Walk upward from `process.cwd()` looking for an existing `.pi/rag/`,
+ *    stopping before `homedir()` so the global store at `~/.pi/rag/` is only
+ *    reached as an explicit fallback (not via walk-up).
+ * 3. With `createIfMissing`, create `${cwd}/.pi/rag/`.
+ * 4. Otherwise, fall back to `${homedir()}/.pi/rag/`.
+ */
+export function getRagDir(opts: { createIfMissing?: boolean } = {}): string {
+  const override = process.env.PI_RAG_DIR;
+  if (override) {
+    if (!existsSync(override)) mkdirSync(override, { recursive: true });
+    return override;
+  }
+  const home = homedir();
+  let dir = process.cwd();
+  // Walk-up search, stopping before $HOME.
+  while (true) {
+    if (dir === home) break;
+    const candidate = join(dir, ".pi", "rag");
+    if (existsSync(candidate)) return candidate;
+    const parent = dirname(dir);
+    if (parent === dir) break; // reached filesystem root
+    dir = parent;
+  }
+  if (opts.createIfMissing) {
+    const local = join(process.cwd(), ".pi", "rag");
+    mkdirSync(local, { recursive: true });
+    return local;
+  }
+  // Fallback: home-dir global. ensureDir handles creation + lens→rag migration.
+  const global = GLOBAL_RAG_DIR();
+  ensureDir(global);
+  return global;
+}
+
+function indexFile(ragDir: string): string { return join(ragDir, "index.json"); }
+function configFile(ragDir: string): string { return join(ragDir, "config.json"); }
+
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 export function loadConfig(): RagConfig {
-  ensureDir();
-  if (!existsSync(CONFIG_FILE)) return defaultConfig();
+  const ragDir = getRagDir();
+  const cfgFile = configFile(ragDir);
+  if (!existsSync(cfgFile)) return defaultConfig();
   try {
-    return { ...defaultConfig(), ...JSON.parse(readFileSync(CONFIG_FILE, "utf-8")) };
+    return { ...defaultConfig(), ...JSON.parse(readFileSync(cfgFile, "utf-8")) };
   } catch { return defaultConfig(); }
 }
 
@@ -92,32 +138,30 @@ export function defaultConfig(): RagConfig {
 }
 
 export function saveConfig(config: RagConfig) {
-  ensureDir();
-  writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+  const ragDir = getRagDir();
+  writeFileSync(configFile(ragDir), JSON.stringify(config, null, 2));
 }
 
 // ─── Index I/O ───────────────────────────────────────────────────────────────
 
-function ensureDir() {
-  if (!existsSync(RAG_DIR)) {
-    // Migrate legacy .pi/lens directory to .pi/rag on first run
-    if (existsSync(LEGACY_DIR)) {
-      try {
-        renameSync(LEGACY_DIR, RAG_DIR);
-      } catch {
-        mkdirSync(RAG_DIR, { recursive: true });
-      }
-    } else {
-      mkdirSync(RAG_DIR, { recursive: true });
-    }
+function ensureDir(ragDir: string) {
+  if (existsSync(ragDir)) return;
+  // Lens→rag migration only applies at the home-dir global store.
+  if (ragDir === GLOBAL_RAG_DIR() && existsSync(LEGACY_DIR)) {
+    try {
+      renameSync(LEGACY_DIR, ragDir);
+      return;
+    } catch { /* fall through to mkdir */ }
   }
+  mkdirSync(ragDir, { recursive: true });
 }
 
 function loadIndex(): IndexMeta {
-  ensureDir();
-  if (!existsSync(INDEX_FILE)) return { chunks: [], files: {}, lastBuild: "" };
+  const ragDir = getRagDir();
+  const idxFile = indexFile(ragDir);
+  if (!existsSync(idxFile)) return { chunks: [], files: {}, lastBuild: "" };
   try {
-    const data = JSON.parse(readFileSync(INDEX_FILE, "utf-8"));
+    const data = JSON.parse(readFileSync(idxFile, "utf-8"));
     return {
       chunks: Array.isArray(data.chunks) ? data.chunks : [],
       files: data.files && typeof data.files === "object" ? data.files : {},
@@ -128,8 +172,8 @@ function loadIndex(): IndexMeta {
 }
 
 function saveIndex(index: IndexMeta) {
-  ensureDir();
-  writeFileSync(INDEX_FILE, JSON.stringify(index, null, 2));
+  const ragDir = getRagDir();
+  writeFileSync(indexFile(ragDir), JSON.stringify(index, null, 2));
 }
 
 export function sha256(data: string): string {
@@ -437,8 +481,6 @@ export async function hybridSearch(
 // ─── Extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  ensureDir();
-
   // ── Auto-inject RAG context before every agent turn ──
   pi.on("before_agent_start", async (event, _ctx) => {
     const config = loadConfig();
@@ -491,6 +533,7 @@ export default function (pi: ExtensionAPI) {
       if (cmd === "index") {
         const path = parts[1] || ".";
         if (!existsSync(path)) return reply(`${RED}Path not found:${RST} ${path}`);
+        getRagDir({ createIfMissing: true });
         const config = loadConfig();
         const absPath = resolve(path);
         if (!config.trackedPaths.includes(absPath)) {
@@ -531,8 +574,10 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.setWidget("rag", undefined);
 
         const secs = (result.durationMs / 1000).toFixed(1);
+        const ragDir = getRagDir();
+        const scope = ragDir === GLOBAL_RAG_DIR() ? "global" : "project";
         return reply(`${GREEN}✅ Indexed:${RST} ${result.indexed} files (${result.chunks} chunks) │ ${result.skipped} unchanged │ ${secs}s\n` +
-          `${D}Now tracking ${config.trackedPaths.length} path(s) │ Model: ${EMBEDDING_MODEL} │ Storage: ${RAG_DIR}${RST}`);
+          `${D}Now tracking ${config.trackedPaths.length} path(s) │ Model: ${EMBEDDING_MODEL} │ Storage: ${ragDir} (${scope})${RST}`);
       }
 
       // ── search ──
@@ -692,7 +737,9 @@ export default function (pi: ExtensionAPI) {
       out += `  Total tokens:    ${GREEN}${totalTokens.toLocaleString()}${RST}\n`;
       out += `  Embedding model: ${D}${index.embeddingModel || "none"}${RST}\n`;
       out += `  Last build:      ${index.lastBuild || "never"}\n`;
-      out += `  Storage:         ${D}${RAG_DIR}${RST}\n\n`;
+      const ragDir = getRagDir();
+      const scope = ragDir === GLOBAL_RAG_DIR() ? "global" : "project";
+      out += `  Storage:         ${D}${ragDir}${RST} ${D}(${scope})${RST}\n\n`;
       out += `  RAG injection:   ${config.ragEnabled ? `${GREEN}enabled${RST}` : `${YELLOW}disabled${RST}`}`;
       out += `  topK=${config.ragTopK}  threshold=${config.ragScoreThreshold}  alpha=${config.ragAlpha}\n`;
 
@@ -734,6 +781,7 @@ export default function (pi: ExtensionAPI) {
     }),
     execute: async (_toolCallId, params) => {
       if (!existsSync(params.path)) return { content: [{ type: "text" as const, text: `Path not found: ${params.path}` }], details: undefined };
+      getRagDir({ createIfMissing: true });
       const config = loadConfig();
       const absPath = resolve(params.path);
       if (!config.trackedPaths.includes(absPath)) {
@@ -791,7 +839,8 @@ export default function (pi: ExtensionAPI) {
         totalTokens: index.chunks.reduce((s, c) => s + c.tokens, 0),
         lastBuild: index.lastBuild || "never",
         ragConfig: config,
-        storagePath: RAG_DIR,
+        storagePath: getRagDir(),
+        storageScope: getRagDir() === GLOBAL_RAG_DIR() ? "global" : "project",
       }, null, 2);
       return { content: [{ type: "text" as const, text }], details: undefined };
     },

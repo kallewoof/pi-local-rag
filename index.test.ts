@@ -7,6 +7,10 @@ const TEST_HOME = vi.hoisted(() => `/tmp/pi-rag-test-${process.pid}`);
 
 vi.mock("node:os", () => ({ homedir: () => TEST_HOME }));
 
+// Pin the RAG store to TEST_HOME so getRagDir() never walks into the real
+// `~/.pi/rag/` of the developer running these tests.
+process.env.PI_RAG_DIR = `${TEST_HOME}/.pi/rag`;
+
 // Prevent real ONNX model downloads; return a fixed 384-dim vector
 vi.mock("@xenova/transformers", () => ({
   pipeline: vi.fn().mockResolvedValue(
@@ -14,7 +18,7 @@ vi.mock("@xenova/transformers", () => ({
   ),
 }));
 
-import { isIndexStale } from "./index.js";
+import { isIndexStale, getRagDir, loadConfig, saveConfig } from "./index.js";
 import defaultExport from "./index.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -428,4 +432,97 @@ describe("rag_index tool", () => {
     expect(Object.keys(idx.files)).toContain(join(projDir, "keep.ts"));
     expect(Object.keys(idx.files)).not.toContain(join(projDir, "drop.ts"));
   });
+});
+
+// ─── Per-project store resolution ────────────────────────────────────────────
+
+describe("getRagDir resolution", () => {
+  // These tests exercise walk-up + auto-create. They must NOT use the
+  // PI_RAG_DIR env override (that override wins above walk-up), so we save
+  // and clear it for each case, restoring afterwards.
+  let savedOverride: string | undefined;
+  let savedCwd: string;
+
+  beforeAll(() => { mkdirSync(TEST_HOME, { recursive: true }); });
+  afterAll(() => { rmSync(TEST_HOME, { recursive: true, force: true }); });
+
+  function withoutOverride(cb: () => void | Promise<void>) {
+    return async () => {
+      savedOverride = process.env.PI_RAG_DIR;
+      savedCwd = process.cwd();
+      delete process.env.PI_RAG_DIR;
+      try { await cb(); }
+      finally {
+        process.chdir(savedCwd);
+        if (savedOverride !== undefined) process.env.PI_RAG_DIR = savedOverride;
+        else delete process.env.PI_RAG_DIR;
+      }
+    };
+  }
+
+  it("walks up from cwd to find a project store", withoutOverride(() => {
+    const projRoot = join(TEST_HOME, "walkup-proj");
+    const projStore = join(projRoot, ".pi", "rag");
+    const subDir = join(projRoot, "src", "deep");
+    mkdirSync(projStore, { recursive: true });
+    mkdirSync(subDir, { recursive: true });
+    process.chdir(subDir);
+
+    expect(getRagDir()).toBe(projStore);
+  }));
+
+  it("auto-creates ./.pi/rag/ at cwd when createIfMissing and no walk-up hit", withoutOverride(() => {
+    const fresh = join(TEST_HOME, "fresh-proj");
+    mkdirSync(fresh, { recursive: true });
+    process.chdir(fresh);
+
+    const dir = getRagDir({ createIfMissing: true });
+    expect(dir).toBe(join(fresh, ".pi", "rag"));
+    // Subsequent calls (no createIfMissing) should now find it via walk-up.
+    expect(getRagDir()).toBe(join(fresh, ".pi", "rag"));
+  }));
+
+  it("falls back to ~/.pi/rag/ when no walk-up hit and no createIfMissing", withoutOverride(() => {
+    const noProj = join(TEST_HOME, "no-proj");
+    mkdirSync(noProj, { recursive: true });
+    process.chdir(noProj);
+
+    expect(getRagDir()).toBe(join(TEST_HOME, ".pi", "rag"));
+  }));
+
+  it("walk-up stops before homedir (does not return ~/.pi/rag/ via walk-up)", withoutOverride(() => {
+    // ${TEST_HOME}/.pi/rag exists (it IS the home global), but walk-up from a
+    // subdir of home should stop AT home and skip checking it via walk-up. The
+    // result is the same path, but it comes from the fallback branch — pinned
+    // by the fact that no project store between cwd and home is consulted.
+    mkdirSync(join(TEST_HOME, ".pi", "rag"), { recursive: true });
+    const sub = join(TEST_HOME, "sub");
+    mkdirSync(sub, { recursive: true });
+    process.chdir(sub);
+
+    expect(getRagDir()).toBe(join(TEST_HOME, ".pi", "rag"));
+  }));
+
+  it("isolates two sibling project stores", withoutOverride(() => {
+    const a = join(TEST_HOME, "iso-a");
+    const b = join(TEST_HOME, "iso-b");
+    mkdirSync(join(a, ".pi", "rag"), { recursive: true });
+    mkdirSync(join(b, ".pi", "rag"), { recursive: true });
+
+    process.chdir(a);
+    saveConfig({ ragEnabled: false, ragTopK: 1, ragScoreThreshold: 0.9, ragAlpha: 0.0, trackedPaths: [a], excludePatterns: ["a-only"] });
+
+    process.chdir(b);
+    saveConfig({ ragEnabled: true, ragTopK: 7, ragScoreThreshold: 0.2, ragAlpha: 0.8, trackedPaths: [b], excludePatterns: ["b-only"] });
+
+    process.chdir(a);
+    const cfgA = loadConfig();
+    expect(cfgA.ragTopK).toBe(1);
+    expect(cfgA.excludePatterns).toEqual(["a-only"]);
+
+    process.chdir(b);
+    const cfgB = loadConfig();
+    expect(cfgB.ragTopK).toBe(7);
+    expect(cfgB.excludePatterns).toEqual(["b-only"]);
+  }));
 });
