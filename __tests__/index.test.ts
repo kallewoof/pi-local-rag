@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURES_DIR = join(__dirname, "fixtures");
 const SAMPLE_PDF = readFileSync(join(FIXTURES_DIR, "sample.pdf"));
+const SAMPLE_IMAGE_PDF = readFileSync(join(FIXTURES_DIR, "sample-image.pdf"));
 
 import {
   chunkText,
@@ -19,6 +20,8 @@ import {
   hybridSearch,
   defaultConfig,
   extractText,
+  getOcrTooling,
+  isSparsePdfText,
 } from "../index.ts";
 
 async function buildMinimalDocx(text: string): Promise<Buffer> {
@@ -384,6 +387,57 @@ describe("extractText", () => {
     const b = await extractText(fp);
     expect(a.hash).toBe(b.hash);
   });
+});
+
+// ─── OCR fallback ────────────────────────────────────────────────────────────
+
+describe("isSparsePdfText", () => {
+  it("empty text → sparse", () => {
+    expect(isSparsePdfText("", 1)).toBe(true);
+  });
+  it("just below 50 chars/page → sparse", () => {
+    expect(isSparsePdfText("x".repeat(49), 1)).toBe(true);
+  });
+  it("at the 50-char threshold → not sparse", () => {
+    expect(isSparsePdfText("x".repeat(50), 1)).toBe(false);
+  });
+  it("scales with page count", () => {
+    expect(isSparsePdfText("x".repeat(150), 3)).toBe(false);
+    expect(isSparsePdfText("x".repeat(149), 3)).toBe(true);
+  });
+  it("numpages of 0 is treated as 1", () => {
+    expect(isSparsePdfText("x".repeat(49), 0)).toBe(true);
+    expect(isSparsePdfText("x".repeat(50), 0)).toBe(false);
+  });
+});
+
+describe("getOcrTooling", () => {
+  it("returns a stable shape", () => {
+    const r = getOcrTooling();
+    if (r.available) {
+      expect(typeof r.langs).toBe("string");
+      expect(r.langs.length).toBeGreaterThan(0);
+    } else {
+      expect(r).toEqual({ available: false });
+    }
+  });
+  it("is cached across calls", () => {
+    expect(getOcrTooling()).toBe(getOcrTooling());
+  });
+});
+
+const ocrTools = getOcrTooling();
+describe.skipIf(!ocrTools.available)("OCR end-to-end", () => {
+  let tmp: string;
+  beforeEach(() => { tmp = mkdtempSync(join(tmpdir(), "rag-ocr-test-")); });
+  afterEach(() => { rmSync(tmp, { recursive: true, force: true }); });
+
+  it("OCRs an image-only PDF and returns the rendered text", async () => {
+    const fp = join(tmp, "image.pdf");
+    writeFileSync(fp, SAMPLE_IMAGE_PDF);
+    const { text } = await extractText(fp);
+    expect(text).toMatch(/OcrMarker/);
+  }, 60_000);
 });
 
 // ─── collectFromTracked ──────────────────────────────────────────────────────

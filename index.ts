@@ -19,10 +19,11 @@
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, renameSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, renameSync } from "node:fs";
 import { join, extname, basename, resolve, relative, dirname } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import ignore from "ignore";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -33,8 +34,8 @@ const GLOBAL_RAG_DIR = () => join(homedir(), ".pi", "rag");
 const RST = "\x1b[0m", B = "\x1b[1m", D = "\x1b[2m";
 const GREEN = "\x1b[32m", YELLOW = "\x1b[33m", CYAN = "\x1b[36m", RED = "\x1b[31m", MAGENTA = "\x1b[35m";
 
-const EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
-const VECTOR_DIM = 384;
+const EMBEDDING_MODEL = "Xenova/bge-m3";
+const VECTOR_DIM = 1024;
 
 const TEXT_EXTS = new Set([
   ".md", ".txt", ".ts", ".js", ".py", ".rs", ".go", ".java", ".c", ".cpp", ".h",
@@ -62,7 +63,7 @@ interface Chunk {
   hash: string;
   indexed: string;
   tokens: number;
-  vector?: number[]; // 384-dim embedding, present after embed step
+  vector?: number[]; // VECTOR_DIM embedding (1024 for bge-m3), present after embed step
 }
 
 interface IndexMeta {
@@ -167,12 +168,26 @@ function loadIndex(): IndexMeta {
   if (!existsSync(idxFile)) return { chunks: [], files: {}, lastBuild: "" };
   try {
     const data = JSON.parse(readFileSync(idxFile, "utf-8"));
-    return {
+    const index: IndexMeta = {
       chunks: Array.isArray(data.chunks) ? data.chunks : [],
       files: data.files && typeof data.files === "object" ? data.files : {},
       lastBuild: data.lastBuild ?? "",
       embeddingModel: data.embeddingModel,
     };
+    // Invalidate vectors produced by a different model — dimensions and
+    // semantic space won't match the current embedder. Mark files as not
+    // embedded so the next index/rebuild pass re-embeds them.
+    if (index.embeddingModel && index.embeddingModel !== EMBEDDING_MODEL) {
+      process.stderr.write(
+        `[rag] Embedding model changed (${index.embeddingModel} → ${EMBEDDING_MODEL}); ` +
+        `dropping ${index.chunks.filter(c => c.vector).length} stale vectors. ` +
+        `Run /rag rebuild to re-embed.\n`,
+      );
+      for (const c of index.chunks) delete c.vector;
+      for (const k of Object.keys(index.files)) index.files[k].embedded = false;
+      index.embeddingModel = EMBEDDING_MODEL;
+    }
+    return index;
   } catch { return { chunks: [], files: {}, lastBuild: "" }; }
 }
 
@@ -202,11 +217,26 @@ async function embed(text: string): Promise<number[]> {
   return Array.from(output.data as Float32Array);
 }
 
+// Batch size for the embedder. Larger batches amortize tokenizer + graph-launch
+// overhead and let onnxruntime vectorize across rows, but pay for padding to
+// the longest sequence in the batch. 16 is a reasonable CPU sweet spot for
+// BGE-M3-sized models; tune if rebuild speed plateaus.
+const EMBED_BATCH_SIZE = 16;
+
 export async function embedBatch(texts: string[], onProgress?: (i: number, total: number) => void): Promise<number[][]> {
-  const results: number[][] = [];
-  for (let i = 0; i < texts.length; i++) {
-    results.push(await embed(texts[i]));
-    onProgress?.(i + 1, texts.length);
+  if (texts.length === 0) return [];
+  const embedder = await getEmbedder();
+  const results: number[][] = new Array(texts.length);
+  for (let start = 0; start < texts.length; start += EMBED_BATCH_SIZE) {
+    const end = Math.min(start + EMBED_BATCH_SIZE, texts.length);
+    const batch = texts.slice(start, end);
+    const output = await embedder(batch, { pooling: "mean", normalize: true });
+    const flat = output.data as Float32Array;
+    const dim = flat.length / batch.length;
+    for (let j = 0; j < batch.length; j++) {
+      results[start + j] = Array.from(flat.subarray(j * dim, (j + 1) * dim));
+    }
+    onProgress?.(end, texts.length);
   }
   return results;
 }
@@ -355,13 +385,84 @@ async function withPdfjsSilenced<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+// ─── OCR fallback for image-based PDFs ───────────────────────────────────────
+
+type OcrTooling = { available: false } | { available: true; langs: string };
+let _ocrTooling: OcrTooling | undefined;
+let _ocrUnavailableLogged = false;
+
+/** One-shot probe for system pdftoppm + tesseract. Caches the result. */
+export function getOcrTooling(): OcrTooling {
+  if (_ocrTooling) return _ocrTooling;
+  const pdftoppm = spawnSync("pdftoppm", ["-v"]);
+  const tess = spawnSync("tesseract", ["--list-langs"], { encoding: "utf-8" });
+  if (pdftoppm.error || tess.error) return (_ocrTooling = { available: false });
+  // tesseract prints langs on stderr in some builds, stdout in others.
+  const out = `${tess.stdout || ""}\n${tess.stderr || ""}`;
+  const have = new Set(out.split(/\r?\n/).map(s => s.trim()).filter(Boolean));
+  const wanted = ["jpn", "eng"].filter(l => have.has(l));
+  if (!wanted.length) return (_ocrTooling = { available: false });
+  return (_ocrTooling = { available: true, langs: wanted.join("+") });
+}
+
+/** Render `buf` to PNGs via pdftoppm, OCR each page via tesseract, return concatenated text. */
+async function ocrPdf(buf: Buffer, langs: string, label: string): Promise<string> {
+  const MAX_PAGES = 200;
+  const PER_PAGE_TIMEOUT_MS = 60_000;
+  const dir = mkdtempSync(join(tmpdir(), "rag-ocr-"));
+  try {
+    const pdfPath = join(dir, "in.pdf");
+    writeFileSync(pdfPath, buf);
+    const render = spawnSync("pdftoppm", ["-png", "-r", "200", pdfPath, join(dir, "p")], { encoding: "utf-8" });
+    if (render.status !== 0) return "";
+    const pages = readdirSync(dir).filter(f => f.startsWith("p-") && f.endsWith(".png")).sort();
+    const total = Math.min(pages.length, MAX_PAGES);
+    if (pages.length > MAX_PAGES) {
+      process.stderr.write(`\r\x1b[2K[rag] OCR ${label}: ${pages.length} pages, capping at ${MAX_PAGES}\n`);
+    }
+    const out: string[] = [];
+    for (let i = 0; i < total; i++) {
+      stderrProgress(`[OCR ${i + 1}/${total}] ${label}`);
+      await yield_();
+      const r = spawnSync("tesseract", [join(dir, pages[i]), "-", "-l", langs], {
+        encoding: "utf-8",
+        timeout: PER_PAGE_TIMEOUT_MS,
+        maxBuffer: 16 * 1024 * 1024,
+      });
+      out.push(r.status === 0 ? (r.stdout ?? "") : "");
+    }
+    process.stderr.write(`\r\x1b[2K`);
+    return out.join("\n\n");
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true }); } catch {}
+  }
+}
+
+/** True if `text` looks too sparse for `numpages` to be the real content of the document. */
+export function isSparsePdfText(text: string, numpages: number): boolean {
+  return text.trim().length < 50 * Math.max(1, numpages);
+}
+
 export async function extractText(fp: string): Promise<{ text: string; hash: string; size: number }> {
   const ext = extname(fp).toLowerCase();
   if (ext === ".pdf") {
     const buf = readFileSync(fp);
     const { default: pdf } = await import("pdf-parse/lib/pdf-parse.js");
     const data = await withPdfjsSilenced(() => pdf(buf));
-    return { text: data.text, hash: sha256(buf.toString("binary")), size: buf.length };
+    let text = data.text;
+    if (isSparsePdfText(text, data.numpages)) {
+      const tools = getOcrTooling();
+      if (tools.available) {
+        const ocr = await ocrPdf(buf, tools.langs, basename(fp));
+        if (ocr.trim().length > text.trim().length) text = ocr;
+      } else if (!_ocrUnavailableLogged) {
+        _ocrUnavailableLogged = true;
+        process.stderr.write(
+          `\r\x1b[2K[rag] OCR unavailable: install pdftoppm + tesseract (with jpn/eng traineddata) to index image PDFs\n`
+        );
+      }
+    }
+    return { text, hash: sha256(buf.toString("binary")), size: buf.length };
   }
   if (ext === ".docx") {
     const buf = readFileSync(fp);
