@@ -6,9 +6,10 @@ import { tmpdir } from "node:os";
 // Must be declared before the import so vitest hoists it above the module load.
 vi.mock("@xenova/transformers", () => ({
   pipeline: vi.fn().mockResolvedValue(
-    vi.fn().mockImplementation(async () => ({
-      data: new Float32Array(384).fill(0.1),
-    }))
+    vi.fn().mockImplementation(async (input: string | string[]) => {
+      const batchSize = Array.isArray(input) ? input.length : 1;
+      return { data: new Float32Array(batchSize * 1024).fill(0.1) };
+    })
   ),
 }));
 
@@ -17,21 +18,23 @@ import { embedBatch, hybridSearch, indexFiles, sha256 } from "../index.ts";
 // ─── embedBatch ───────────────────────────────────────────────────────────────
 
 describe("embedBatch", () => {
-  it("returns one 384-dim vector per text", async () => {
+  it("returns one 1024-dim vector per text", async () => {
     const vecs = await embedBatch(["hello world", "foo bar"]);
     expect(vecs).toHaveLength(2);
-    expect(vecs[0]).toHaveLength(384);
-    expect(vecs[1]).toHaveLength(384);
+    expect(vecs[0]).toHaveLength(1024);
+    expect(vecs[1]).toHaveLength(1024);
   });
 
   it("returns empty array for empty input", async () => {
     expect(await embedBatch([])).toEqual([]);
   });
 
-  it("calls onProgress once per item with correct index and total", async () => {
+  it("calls onProgress once per batch with cumulative completed count", async () => {
+    // 3 items fit in a single batch (EMBED_BATCH_SIZE=16), so one callback
+    // fires with the final cumulative count.
     const calls: [number, number][] = [];
     await embedBatch(["a", "b", "c"], (i, total) => calls.push([i, total]));
-    expect(calls).toEqual([[1, 3], [2, 3], [3, 3]]);
+    expect(calls).toEqual([[3, 3]]);
   });
 
   it("works without an onProgress callback", async () => {
@@ -69,7 +72,7 @@ function makeChunk(content: string, vector?: number[]): Chunk {
 }
 
 describe("hybridSearch with vectors", () => {
-  const vec = (seed: number) => Array.from({ length: 384 }, (_, i) => (i === seed ? 1 : 0));
+  const vec = (seed: number) => Array.from({ length: 1024 }, (_, i) => (i === seed ? 1 : 0));
 
   it("uses vector scores when chunks have embeddings", async () => {
     // All chunks have identical mocked embed result (0.1 everywhere), so vector
