@@ -12,6 +12,20 @@ npm run test:watch     # Run tests in watch mode
 
 Node >=20 required. There is no lint script configured.
 
+### Optional system dependencies
+
+Plain `.pdf`/`.docx` indexing uses npm deps only. PDF OCR fallback (for image-only PDFs)
+shells out to system tools and is auto-detected at runtime — if either is missing, OCR is
+silently skipped and only embedded text is indexed:
+
+- `pdftoppm` (poppler-utils) — renders each page to PNG.
+- `tesseract` with `jpn` and/or `eng` traineddata — OCRs each PNG.
+
+Debian/Ubuntu install:
+```bash
+apt-get install poppler-utils tesseract-ocr tesseract-ocr-jpn tesseract-ocr-eng
+```
+
 ## Architecture
 
 **pi-local-rag** is a single-file TypeScript extension (`index.ts`) for the [Pi coding agent](https://github.com/badlogic/pi-mono). It ships as TypeScript source — Pi compiles it at install time. No build output is committed.
@@ -36,11 +50,15 @@ Stopping walk-up before `$HOME` is the key invariant — it makes `~/.pi/rag/` r
 
 ### Indexing pipeline
 
-1. Walk directory tree, filtering by `TEXT_EXTS` and skipping `SKIP_DIRS` plus hidden dirs. Files >500 KB are skipped.
-2. SHA-256 hash the file content; skip if hash matches existing index entry (`files[fp].embedded === true`).
-3. Chunk each file: split on blank lines, cap at 50 lines, backtrack up to 15 lines to find a blank-line boundary. Discard chunks <20 chars.
-4. Batch-embed chunks via `@xenova/transformers` (`Xenova/all-MiniLM-L6-v2`, 384-dim ONNX). The pipeline singleton (`_pipeline`) is lazy-initialized on first embed call.
-5. Write updated `index.json`.
+1. Walk directory tree, filtering by `TEXT_EXTS` (≤500 KB) and `BINARY_DOC_EXTS` — currently `.pdf` and `.docx` (≤10 MB) — and skipping `SKIP_DIRS` plus hidden dirs.
+2. `extractText(fp)` decodes the file to UTF-8 text:
+   - text extensions → `readFileSync(fp, "utf-8")`.
+   - `.pdf` → `pdf-parse` (pdfjs warnings filtered out via a scoped `console.log` patch). If the extracted text is sparse (`< 50 chars / numpages`), fall back to OCR via `pdftoppm` + `tesseract` when those tools are present.
+   - `.docx` → `mammoth.extractRawText`.
+3. SHA-256 hash the file content — raw bytes for binaries, decoded text for plain — and skip if it matches an existing index entry (`files[fp].embedded === true`). Same hash means OCR is also skipped on rebuild.
+4. Chunk each file: split on blank lines, cap at 50 lines, backtrack up to 15 lines to find a blank-line boundary. Discard chunks <20 chars.
+5. Batch-embed chunks via `@xenova/transformers` (`Xenova/all-MiniLM-L6-v2`, 384-dim ONNX). The pipeline singleton (`_pipeline`) is lazy-initialized on first embed call.
+6. Write updated `index.json`.
 
 ### Search
 
