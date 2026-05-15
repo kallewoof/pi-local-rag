@@ -444,6 +444,21 @@ export function isSparsePdfText(text: string, numpages: number): boolean {
   return text.trim().length < 50 * Math.max(1, numpages);
 }
 
+/**
+ * Cheap hash + size for a file — reads bytes (binary docs) or UTF-8 text (anything else)
+ * but does NOT run pdf-parse / OCR / mammoth. Used by indexFiles to skip unchanged files
+ * before paying the extraction cost.
+ */
+export function fileHash(fp: string): { hash: string; size: number } {
+  const ext = extname(fp).toLowerCase();
+  if (BINARY_DOC_EXTS.has(ext)) {
+    const buf = readFileSync(fp);
+    return { hash: sha256(buf.toString("binary")), size: buf.length };
+  }
+  const text = readFileSync(fp, "utf-8");
+  return { hash: sha256(text), size: text.length };
+}
+
 export async function extractText(fp: string): Promise<{ text: string; hash: string; size: number }> {
   const ext = extname(fp).toLowerCase();
   if (ext === ".pdf") {
@@ -504,15 +519,17 @@ export async function indexFiles(
     const name = basename(fp);
 
     try {
-      const { text: content, hash, size } = await extractText(fp);
-
-      if (index.files[fp]?.hash === hash && index.files[fp]?.embedded) {
+      // Cheap hash-first skip: avoids pdf-parse / OCR / mammoth on unchanged binaries.
+      const pre = fileHash(fp);
+      if (index.files[fp]?.hash === pre.hash && index.files[fp]?.embedded) {
         skipped++;
         stderrProgress(`[${i + 1}/${total}] ${pct}% skipped ${name}`);
         progress?.onFile?.(i + 1, total, name, skipped);
         await yield_(); // let TUI paint
         continue;
       }
+
+      const { text: content, hash, size } = await extractText(fp);
 
       index.chunks = index.chunks.filter(c => c.file !== fp);
       const rawChunks = chunkText(content);
