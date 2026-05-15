@@ -11,7 +11,8 @@
  * /rag index <path>     → index + embed a file or directory
  * /rag search <query>   → hybrid search (BM25 + vector)
  * /rag status           → show index stats
- * /rag rebuild          → rebuild entire index
+ * /rag rebuild          → rebuild entire index (re-embeds everything)
+ * /rag refresh          → incremental refresh (only new/changed files)
  * /rag clear            → clear index
  * /rag on|off           → toggle auto-injection
  *
@@ -688,7 +689,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── /rag command ──
   pi.registerCommand("rag", {
-    description: "pi-local-rag: /rag index|search|find|status|rebuild|clear|exclude|on|off",
+    description: "pi-local-rag: /rag index|search|find|status|rebuild|refresh|clear|exclude|on|off",
     handler: async (args, ctx) => {
       const reply = (text: string) => pi.sendMessage({ customType: "rag", content: text, display: true });
       const parts = (args || "").trim().split(/\s+/);
@@ -848,6 +849,50 @@ export default function (pi: ExtensionAPI) {
 
         const secs = (result.durationMs / 1000).toFixed(1);
         return reply(`${GREEN}✅ Rebuilt:${RST} ${result.indexed} re-indexed │ ${result.skipped} unchanged │ ${deletedFiles.length} deleted │ ${result.chunks} chunks │ ${secs}s`);
+      }
+
+      // ── refresh (on-demand equivalent of the 24h auto-refresh) ──
+      if (cmd === "refresh") {
+        const config = loadConfig();
+        const index = loadIndex();
+        const files = config.trackedPaths.length
+          ? collectFromTracked(config)
+          : Object.keys(index.files).filter(f => existsSync(f));
+        if (!files.length) {
+          return reply(`${YELLOW}No tracked files to refresh. Run /rag index <path> first.${RST}`);
+        }
+
+        ctx.ui.notify(`Refreshing ${files.length} files...`, "info");
+
+        function progressBar(n: number, total: number, width = 24): string {
+          const filled = Math.round((n / total) * width);
+          return CYAN + "█".repeat(filled) + D + "░".repeat(width - filled) + RST;
+        }
+
+        const result = await indexFiles(files, {
+          onFile(current, total, filename, skipped) {
+            const pct = Math.round((current / total) * 100);
+            const bar = progressBar(current, total);
+            ctx.ui.setStatus("rag", `■ Refreshing ${pct}% │ ${current}/${total} │ ${skipped} unchanged`);
+            ctx.ui.setWidget("rag", [
+              `${B}${CYAN}Refreshing${RST}  ${bar}  ${GREEN}${pct}%${RST}`,
+              `${D}file:    ${RST}${filename}`,
+              `${D}done:    ${RST}${GREEN}${current - skipped} new/changed${RST}  ${D}${skipped} unchanged${RST}`,
+            ]);
+          },
+          onChunk(ci, total, filename) {
+            ctx.ui.setStatus("rag", `■ Embedding ${filename} — chunk ${ci}/${total}`);
+          },
+          onSave() {
+            ctx.ui.setStatus("rag", `■ Saving index...`);
+          },
+        });
+
+        ctx.ui.setStatus("rag", undefined);
+        ctx.ui.setWidget("rag", undefined);
+
+        const secs = (result.durationMs / 1000).toFixed(1);
+        return reply(`${GREEN}✅ Refreshed:${RST} ${result.indexed} new/changed │ ${result.skipped} unchanged │ ${result.chunks} chunks │ ${secs}s`);
       }
 
       // ── exclude ──
